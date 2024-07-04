@@ -1,6 +1,9 @@
 # Maximum Clique on GPUs
 
-This repository stores the software presented in '_Efficiently Maximum Clique Computation on Many Core Graphic Processing Unit_', ICSOFT 2024 Conference.
+This repository stores the software presented in:
+
+Lorenzo Cardone, Salvatore Di Martino, Stefano Quer, "Efficiently Computing Maximum Clique of Sparse Graphs with Many-Core Graphical Processing Units", ICSOFT 2024: 19th International Conference on Software Technologies, Dijon, France, July 2024, pages 539-546, Edited by Hans-Georg Fill, Francisco Jos\'e Domínguez Mayo, Marten van Sinderen and Leszek Maciaszek,
+2024 by SCITEPRESS – Science and Technology Publications, Lda., ISSN: 2184-2833, ISBN: 978-989-758-706-1, DOI: 10.5220/0000178200003753
 
 ## Minimum Requirements
 
