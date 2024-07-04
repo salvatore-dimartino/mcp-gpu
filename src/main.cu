@@ -11,7 +11,6 @@
 #include "../include/main_support.cuh"
 #include "../include/timer.h"
 #include "../include/utils.cuh"
-#include "../mce/mce.cuh"
 #include "../mcp/mcp.cuh"
 
 using namespace std;
@@ -102,7 +101,8 @@ int main(int argc, char **argv)
   Log(info, "Degeneracy ordering time: %f s", degeneracy_time.elapsed());
   Log(info, "Heuristic clique size: %d", kcore.heurCliqueSize.getSingle(0));
 
-  if (kcore.heurCliqueSize.getSingle(0) == kcore.count() + 1)
+  if (config.mt == MAINTASK::MCP && kcore.heurCliqueSize.getSingle(0) == kcore.count() + 1
+    || config.mt == MAINTASK::MCP_EVAL && kcore.heurCliqueSize.getSingle(0) == kcore.count() + 1)
   {
     Log(info, "Maximum clique found in preprocessing time, size: %u", kcore.heurCliqueSize.getSingle(0));
     g.rowInd->freeGPU();
@@ -273,44 +273,6 @@ int main(int argc, char **argv)
 
   graph::COOCSRGraph_d<DataType> *gsplit = (graph::COOCSRGraph_d<DataType> *)malloc(sizeof(graph::COOCSRGraph_d<DataType>));
 
-  if (config.mt == MAINTASK::MCE)
-  {
-
-    gsplit->numNodes = n;
-    gsplit->numEdges = m;
-    gsplit->capacity = m;
-
-    CUDA_RUNTIME(cudaMallocManaged((void **)&(gsplit->colInd), (m) * (uint64) sizeof(DataType)));
-    CUDA_RUNTIME(cudaMallocManaged((void **)&(gsplit->splitPtr), (n + 1) * (uint64) sizeof(DataType)));
-
-    CUDA_RUNTIME(cudaMallocManaged((void **)&(gsplit->rowPtr), (n + 1) * (uint64) sizeof(DataType)));
-    CUDA_RUNTIME(cudaMemcpy(gsplit->rowPtr, gd->rowPtr, (n + 1) * (uint64) sizeof(DataType), cudaMemcpyDefault));
-
-    CUDA_RUNTIME(cudaMallocManaged((void **)&(gsplit->rowInd), (m) * (uint64) sizeof(DataType)));
-    CUDA_RUNTIME(cudaMemcpy(gsplit->rowInd, gd->rowInd, (m) * (uint64) sizeof(DataType), cudaMemcpyDefault));
-
-    graph::GPUArray<DataType> tmp_block("Temp Block", AllocationTypeEnum::unified, (m + block_size - 1) / block_size, config.deviceId);
-    graph::GPUArray<DataType> split_ptr("Split Ptr", AllocationTypeEnum::unified, n + 1, config.deviceId);
-    tmp_block.setAll(0, true);
-    split_ptr.setAll(0, true);
-    execKernel(set_priority<DataType>, (m + block_size - 1) / block_size, block_size, config.deviceId, false, *gd, m, kcore.nodePriority.gdata(), tmp_block.gdata(), split_ptr.gdata());
-    CUDA_RUNTIME(cudaMemcpy(gsplit->splitPtr, split_ptr.gdata(), (n + 1) * (uint64) sizeof(DataType), cudaMemcpyDefault));
-    execKernel(split_pointer<DataType>, (n + 1 + block_size - 1) / block_size, block_size, config.deviceId, false, *gd, gsplit->splitPtr);
-    CUBScanExclusive<DataType, DataType>(split_ptr.gdata(), split_ptr.gdata(), n + 1, config.deviceId, 0);
-    CUBScanExclusive<DataType, DataType>(tmp_block.gdata(), tmp_block.gdata(), (m + block_size - 1) / block_size, config.deviceId, 0);
-
-    execKernel((split_data<DataType, block_size>), (m + block_size - 1) / block_size, block_size, config.deviceId, false, *gd, m, kcore.nodePriority.gdata(), tmp_block.gdata(), split_ptr.gdata(), gsplit->splitPtr, gsplit->colInd);
-    tmp_block.freeGPU();
-    split_ptr.freeGPU();
-
-    cudaMemAdvise(gsplit->colInd, (m) * (uint64) sizeof(DataType), cudaMemAdviseSetReadMostly, config.deviceId /*ignored*/);
-    cudaMemAdvise(gsplit->splitPtr, (n + 1) * (uint64) sizeof(DataType), cudaMemAdviseSetReadMostly, config.deviceId /*ignored*/);
-    cudaMemAdvise(gsplit->rowPtr, (n + 1) * (uint64) sizeof(DataType), cudaMemAdviseSetReadMostly, config.deviceId /*ignored*/);
-    cudaMemAdvise(gsplit->rowInd, (m) * (uint64) sizeof(DataType), cudaMemAdviseSetReadMostly, config.deviceId /*ignored*/);
-
-  }
-
-
   if (config.mt == MAINTASK::MCP || config.mt == MAINTASK::MCP_EVAL)
   {
     
@@ -358,41 +320,6 @@ int main(int argc, char **argv)
   
   Log(info, "CSR Recreation time: %f s", csr_recreation_time.elapsed());
 
-  if(config.mt == MAINTASK::MCE) {
-
-    vector<graph::MultiGPU_MCE<DataType>> mce;
-
-    for (int i = 0; i < config.gpus.size(); i++)
-      mce.push_back(graph::MultiGPU_MCE<DataType>(config.gpus[i], i, config.gpus.size()));
-
-    Timer mce_timer;
-
-    #pragma omp parallel for
-    for (int i = 0; i < config.gpus.size(); i++)
-    {
-      if (kcore.count() <= 300)
-      {
-        mce[i].mce_count<1>(*gsplit, config);
-      }
-      else
-      {
-        mce[i].mce_count<8>(*gsplit, config);
-      }
-      printf("Finished Launching Instance %d.\n", i);
-    }
-    for (int i = 0; i < config.gpus.size(); i++)
-      mce[i].sync();
-
-    double time = mce_timer.elapsed();
-    Log(info, "count time %f s", time);
-
-    uint64 tot = 0;
-    for (int i = 0; i < config.gpus.size(); i++)
-      tot += mce[i].show(n);
-    cout << "Found " << tot << " maximal cliques in total." << '\n';
-
-  }
-
   if(config.mt == MAINTASK::MCP || config.mt == MAINTASK::MCP_EVAL) {
 
     vector<graph::MultiGPU_MCP<DataType>> mcp;
@@ -416,6 +343,7 @@ int main(int argc, char **argv)
 
     uint64 max_clique = 0;
     for (int i = 0; i < config.gpus.size(); i++){
+      mcp[i].get_results(config, *gsplit);
       auto clique_size = mcp[i].show();
       if (max_clique < clique_size)
         max_clique = clique_size;

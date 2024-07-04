@@ -2,9 +2,8 @@
 #include "../include/defs.h"
 #include "../include/queue.cuh"
 #include "../include/utils.cuh"
-#include "../mce/mce_utils.cuh"
-#include "../mce/parameter.cuh"
-#include "../mcp/mcp_utils.cuh"
+#include "mcp_utils.cuh"
+#include "parameter.cuh"
 		
 
 // /////////////////////////////////////////////////////////////////////////////////
@@ -31,6 +30,8 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 	__shared__ uint32_t number_of_subgraph;
 	__shared__ volatile T second_level_work_stealing;
 	__shared__ volatile unsigned long long branches;
+	__shared__ T __warp__(work_stealing);
+	__shared__ T max_clique_size, core_i;
 
 	lh.numPartitions = BLOCK_DIM_X / CPARTSIZE; // Number of warp scheduler in block
 	lh.gwx = (blockDim.x * blockIdx.x + threadIdx.x) / CPARTSIZE;
@@ -52,6 +53,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 		max_subgraph_width = 0;
 		number_of_subgraph = 0;
 		branches = 0;
+
 	}
 
 	if (laneIdx == 0) {
@@ -89,19 +91,22 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 				__syncthreads();
 				continue;
 			}
-
-			if (gh.core[sh.i] + 1 <= (*gh.Cmax_size))
+			__syncthreads();
+			fetch_both(core_i, gh.core[sh.i], max_clique_size, (*gh.Cmax_size));
+			__syncthreads();
+			if (core_i < max_clique_size)
 			{
 				__syncthreads();
 				continue;
 			}
 			mcp::setup_stack_first_level_psanse_(gh, sh);
 
-			if (sh.usrcLen <= (*gh.Cmax_size))
+			if (sh.usrcLen <= max_clique_size - 1)
 			{
 				__syncthreads();
 				continue;
 			}
+			__syncthreads();
 
 			mcp::encode_clear(lh, sh, sh.usrcLen);
 		
@@ -109,7 +114,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 			for (T j = lh.wx; j < sh.usrcLen; j += lh.numPartitions)
 			{
 				auto &g = gh.gsplit;
-				graph::warp_sorted_count_and_encode_full<T, CPARTSIZE>(
+				mcp::graph::warp_sorted_count_and_encode_full<T, CPARTSIZE>(
 					&g.colInd[sh.usrcStart], sh.usrcLen,
 					&g.colInd[g.rowPtr[g.colInd[sh.usrcStart + j]]], 
 					g.splitPtr[g.colInd[sh.usrcStart + j]] 
@@ -120,20 +125,19 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 			__syncthreads();
 
 			// Run greedy coloring
-			const T ub = (*gh.Cmax_size);
-			int xi = mcp::compute_upperbound_chromatic_number_psanse(lh, sh, ub - 1, sh.num_divs_local);
-			if (xi <= ub - 1)
+			if (mcp::compute_upperbound_chromatic_number_psanse(lh, sh, max_clique_size - 1, sh.num_divs_local) <= max_clique_size - 1)
 			{
-				if (threadIdx.x == 0 && gh.verbose) cut_by_color_l1++;
+				if (gh.verbose && threadIdx.x == 0) cut_by_color_l1++;
 				__syncthreads();
 				continue;
 			}
+			__syncthreads();
 
 			// Compute k-core reduction of the first level and the ordering
-			mcp::compute_kcore_first_level(lh, sh, gh, sh.num_divs_local, sh.encode);
+			mcp::compute_kcore_first_level(lh, sh, gh, sh.num_divs_local, sh.encode, max_clique_size);
 
-			if (sh.usrcLen <= (*gh.Cmax_size) || sh.max_core_l1 + 1 <= (*gh.Cmax_size)) {
-				if (threadIdx.x == 0 && gh.verbose)	cut_by_kcore_l1++;
+			if (sh.usrcLen <= max_clique_size - 1 || sh.max_core_l1 + 1 < max_clique_size) {
+				if (gh.verbose && threadIdx.x == 0)	cut_by_kcore_l1++;
 				__syncthreads();
 				continue;
 			}
@@ -144,8 +148,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 
 			// Compute the induced subgraph based on degeneracy ordered first level
 			// Warp-parallel
-			if (threadIdx.x == 0)
-				subgraph_edges = 0;
+			fetch(subgraph_edges, 0);
 
 			__syncthreads();
 
@@ -154,7 +157,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 				for (T j = lh.wx; j < sh.usrcLen; j += lh.numPartitions)
 				{
 					auto &g = gh.gsplit;
-					graph::warp_sorted_count_and_encode_full_stats<T, CPARTSIZE>(
+					mcp::graph::warp_sorted_count_and_encode_full_stats<T, CPARTSIZE>(
 						sh.ordering, sh.usrcLen,
 						&g.colInd[g.rowPtr[sh.ordering[j]]], 
 						g.splitPtr[sh.ordering[j]] 
@@ -167,7 +170,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 				for (T j = lh.wx; j < sh.usrcLen; j += lh.numPartitions)
 				{
 					auto &g = gh.gsplit;
-					graph::warp_sorted_count_and_encode_full<T, CPARTSIZE>(
+					mcp::graph::warp_sorted_count_and_encode_full<T, CPARTSIZE>(
 						sh.ordering, sh.usrcLen,
 						&g.colInd[g.rowPtr[sh.ordering[j]]], 
 						g.splitPtr[sh.ordering[j]] 
@@ -178,7 +181,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 			
 			__syncthreads();
 
-			if (threadIdx.x == 0 && gh.verbose)
+			if (gh.verbose && threadIdx.x == 0)
 			{
 				float current_density = static_cast<float>(subgraph_edges) / static_cast<float>(sh.usrcLen * (sh.usrcLen - 1));
 				max_subgraph_density = max(max_subgraph_density, current_density);
@@ -193,22 +196,19 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 
 			// Determine intersection and put them into sh.pl
 			mcp::compute_P_intersection_to_first_level(sh, sh.usrcLen, sh.num_divs_local, sh.to_bl);
-
-			mcp::compute_branches_fast_second_level(lh, sh, int((*gh.Cmax_size)) - 1, sh.num_divs_local);
+			__syncthreads(); fetch(max_clique_size, (*gh.Cmax_size)); __syncthreads();
+			mcp::compute_branches_fast_second_level(lh, sh, int(max_clique_size) - 1, sh.num_divs_local);
 
 			// If B = 0
-			if (mcp::b_maximality(gh, sh, lh)) { if (threadIdx.x == 0 && gh.verbose) cut_by_color++; __syncthreads(); continue; }
+			if (mcp::b_maximality(gh, sh, lh)) { if (gh.verbose && threadIdx.x == 0) cut_by_color++; __syncthreads(); continue; }
 
 			mcp::compute_branching_aux_set_second_level(sh, sh.to_col);
 
 			// setup stack for warps
 			mcp::setup_warp_stack_second_level(gh, lh, sh, wsh[warpIdx]);
 
-			if (laneIdx == 0) 
-			{
-				second_level_work_stealing = 0;
-				reset_warp_shared_queue(sh.queue, sh.tickets, sh.head, sh.tail);
-			}
+			fetch(second_level_work_stealing, 0);
+			if (laneIdx == 0) reset_warp_shared_queue(sh.queue, sh.tickets, sh.head, sh.tail);
 			__syncthreads();
 
 		}
@@ -219,7 +219,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 			{
 				//printf("warp %u waiting\n", wsh[warpIdx].sm_warp_id);
 				//printf("Waiting warps: %u / %u\n", tail->load(cuda::memory_order_relaxed) - head->load(cuda::memory_order_relaxed), WARPS);
-				wait_for_donor_warp_(gh.work_ready[wsh[warpIdx].sm_warp_id], sh.state, wsh[warpIdx].state, 
+				mcp::wait_for_donor_warp_(gh.work_ready[wsh[warpIdx].sm_warp_id], sh.state, wsh[warpIdx].state, 
 							queue_caller(queue, tickets, head, tail));
 			}
 			__syncwarp();
@@ -237,6 +237,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 			if (sh.state == 0 && wsh[warpIdx].state == 0)
 			{
 				// Dequeue a vertex from P
+				__syncwarp();
 				if (laneIdx == 0)	wsh[warpIdx].i = atomicAdd((T*)&second_level_work_stealing, 1);
 				__syncwarp();
 
@@ -252,16 +253,19 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 					__syncwarp();
 					continue;
 				}
+				__syncwarp();
 
 				const T li = wsh[warpIdx].i >> 5;
 				const T ri = 1 << (wsh[warpIdx].i & 0x1F);
 
 				// If is not branching index
+				__syncwarp();
 				if ((sh.to_bl[li] & ri) == 0)
 				{
 					__syncwarp();
 					continue;
 				}
+				__syncwarp();
 
 				mcp::compute_warp_P_intersection_second_level(lh, wsh[warpIdx], wsh[warpIdx].num_divs_local, sh.to_bl, sh.to_col, wsh[warpIdx].pl);
 
@@ -293,41 +297,27 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 				mcp::setup_warp_stack_donor_psanse_(gh, lh, wsh[warpIdx]);
 			}
 
-			//if (laneIdx == 0) printf("warp %u starts\n", lh.gwx);
+			__syncwarp();
+
 			while (wsh[warpIdx].l >= wsh[warpIdx].base_l)
 			{
-				__syncwarp();
-				
+
 				if (!wsh[warpIdx].colored[warp_current_level]) 
 				{				
 					// If P = 0
 					if (mcp::p_warp_maximality_(gh, lh, wsh[warpIdx])) continue;
-					if (gh.verbose && laneIdx == 0) atomicAdd((unsigned long long *)&branches, 1);
+					if (gh.verbose && laneIdx == 0) atomicAdd((unsigned long long *)&branches, 1); __syncwarp();
 					mcp::compute_warp_branches_fast_(lh, wsh[warpIdx], int((*gh.Cmax_size)) - int(wsh[warpIdx].l - 1), wsh[warpIdx].num_divs_local,
 						warp_current_level, wsh[warpIdx].pl + warp_current_level * wsh[warpIdx].num_divs_local, 
 						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local);
 
 					// If B = 0
-					if (mcp::b_warp_maximality_(gh, wsh[warpIdx], lh)) { if (laneIdx == 0 && gh.verbose) atomicAdd(&cut_by_color, 1); __syncwarp(); continue; }
+					if (mcp::b_warp_maximality_(gh, wsh[warpIdx], lh)) { if (gh.verbose && laneIdx == 0) atomicAdd(&cut_by_color, 1); __syncwarp(); continue; }
 					mcp::compute_warp_branching_aux_set_(lh, wsh[warpIdx], wsh[warpIdx].num_divs_local, wsh[warpIdx].pl + warp_current_level * wsh[warpIdx].num_divs_local, 
 						wsh[warpIdx].al + warp_current_level * wsh[warpIdx].num_divs_local, wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local);
+					fetch_warp(work_stealing, (*gh.work_stealing), warpIdx); __syncwarp();
 				}
 
-				// Donates in the global queue
-				if ((*gh.work_stealing) >= gh.iteration_limit)
-				{
-					mcp::prepare_warp_fork_(lh, wsh[warpIdx]);
-					mcp::get_warp_candidates_for_next_level_<true>(lh, wsh[warpIdx], warp_current_level,
-						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local);
-					mcp::try_dequeue_warp_global(lh, gh, wsh[warpIdx], queue_caller(queue, tickets, head, tail));
-
-					if (wsh[warpIdx].fork) mcp::do_warp_fork_global(lh, gh, wsh[warpIdx], wsh[warpIdx].num_divs_local,
-						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local,
-						wsh[warpIdx].al + warp_current_level * wsh[warpIdx].num_divs_local,
-							queue_caller(queue, tickets, head, tail));
-
-				}
-				
 				// Donates in the local queue
 				if (sh.state == 0 && second_level_work_stealing >= sh.usrcLen) 
 				{
@@ -341,12 +331,25 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 						wsh[warpIdx].al + warp_current_level * wsh[warpIdx].num_divs_local, sh);
 				}
 
+				// Donates in the global queue
+				if (work_stealing[warpIdx] >= gh.iteration_limit)
+				{
+					mcp::prepare_warp_fork_(lh, wsh[warpIdx]);
+					mcp::get_warp_candidates_for_next_level_<true>(lh, wsh[warpIdx], warp_current_level,
+						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local);
+					mcp::try_dequeue_warp_global(lh, gh, wsh[warpIdx], queue_caller(queue, tickets, head, tail));
+
+					if (wsh[warpIdx].fork) mcp::do_warp_fork_global(lh, gh, wsh[warpIdx], wsh[warpIdx].num_divs_local,
+						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local,
+						wsh[warpIdx].al + warp_current_level * wsh[warpIdx].num_divs_local,
+							queue_caller(queue, tickets, head, tail));
+
+				}
+
 				// If B visited
 				if (!mcp::get_next_warp_branching_index_(gh, lh, wsh[warpIdx],
 					wsh[warpIdx].level_pointer_index[warp_current_level], 
 					wsh[warpIdx].usrcLen, wsh[warpIdx].bl + wsh[warpIdx].num_divs_local * warp_current_level)) continue;	
-
-				//if (laneIdx == 0) printf("l1: %u, i:%u, l: %u, c: %u, w: %u\n", sh.i, wsh[warpIdx].i, wsh[warpIdx].l, lh.newIndex, lh.gwx);
 
 				mcp::next_warp_pointer(lh, wsh[warpIdx].level_pointer_index[warp_current_level]);
 				mcp::compute_warp_P_intersection_for_next_level_(lh, wsh[warpIdx], wsh[warpIdx].num_divs_local,
@@ -354,6 +357,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 					wsh[warpIdx].pl + warp_next_level * wsh[warpIdx].num_divs_local);
 				
 				mcp::go_to_next_level_warp(lh, wsh[warpIdx].l, wsh[warpIdx].level_pointer_index[warp_next_level], wsh[warpIdx].colored[warp_next_level]);
+
 			}
 		
 			__syncwarp();
@@ -382,6 +386,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_psanse(
 		__syncwarp();
 
 	}
+
 		
 	// Collect statistics	
 	if (gh.verbose && threadIdx.x == 0)
@@ -424,6 +429,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 	__shared__ uint32_t number_of_subgraph;
 	__shared__ volatile T second_level_work_stealing;
 	__shared__ volatile unsigned long long branches;
+	__shared__ T __warp__(work_stealing), max_clique_size, core_i;
 
 	lh.numPartitions = BLOCK_DIM_X / CPARTSIZE; // Number of warp scheduler in block
 	lh.gwx = (blockDim.x * blockIdx.x + threadIdx.x) / CPARTSIZE;
@@ -483,18 +489,23 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 				continue;
 			}
 
-			if (gh.core[sh.i] + 1 <= (*gh.Cmax_size))
+			fetch_both(core_i, gh.core[sh.i], max_clique_size, (*gh.Cmax_size));
+			__syncthreads();
+			if (core_i < max_clique_size)
 			{
 				__syncthreads();
 				continue;
 			}
+			__syncthreads();
+
 			mcp::setup_stack_first_level_psanse_(gh, sh);
 
-			if (sh.usrcLen <= (*gh.Cmax_size))
+			if (sh.usrcLen <= max_clique_size - 1)
 			{
 				__syncthreads();
 				continue;
 			}
+			__syncthreads();
 
 			mcp::encode_clear(lh, sh, sh.usrcLen);
 		
@@ -502,7 +513,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 			for (T j = lh.wx; j < sh.usrcLen; j += lh.numPartitions)
 			{
 				auto &g = gh.gsplit;
-				graph::warp_sorted_count_and_encode_full<T, CPARTSIZE>(
+				mcp::graph::warp_sorted_count_and_encode_full<T, CPARTSIZE>(
 					&g.colInd[sh.usrcStart], sh.usrcLen,
 					&g.colInd[g.rowPtr[g.colInd[sh.usrcStart + j]]], 
 					g.splitPtr[g.colInd[sh.usrcStart + j]] 
@@ -513,20 +524,18 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 			__syncthreads();
 
 			// Run greedy coloring
-			const T ub = (*gh.Cmax_size);
-			int xi = mcp::compute_upperbound_chromatic_number_psanse(lh, sh, ub - 1, sh.num_divs_local);
-			if (xi <= ub - 1)
+			if (mcp::compute_upperbound_chromatic_number_psanse(lh, sh, max_clique_size - 1, sh.num_divs_local) <= max_clique_size - 1)
 			{
-				if (threadIdx.x == 0 && gh.verbose) cut_by_color_l1++;
+				if (gh.verbose && threadIdx.x == 0) cut_by_color_l1++;
 				__syncthreads();
 				continue;
 			}
 
 			// Compute k-core reduction of the first level and the ordering
-			mcp::compute_kcore_first_level(lh, sh, gh, sh.num_divs_local, sh.encode);
+			mcp::compute_kcore_first_level(lh, sh, gh, sh.num_divs_local, sh.encode, max_clique_size);
 
-			if (sh.usrcLen <= (*gh.Cmax_size) || sh.max_core_l1 + 1 <= (*gh.Cmax_size)) {
-				if (threadIdx.x == 0 && gh.verbose)	cut_by_kcore_l1++;
+			if (sh.usrcLen <= max_clique_size - 1 || sh.max_core_l1 + 1 < max_clique_size) {
+				if (gh.verbose && threadIdx.x == 0)	cut_by_kcore_l1++;
 				__syncthreads();
 				continue;
 			}
@@ -537,8 +546,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 
 			// Compute the induced subgraph based on degeneracy ordered first level
 			// Warp-parallel
-			if (threadIdx.x == 0)
-				subgraph_edges = 0;
+			fetch(subgraph_edges, 0);
 
 			__syncthreads();
 
@@ -547,7 +555,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 				for (T j = lh.wx; j < sh.usrcLen; j += lh.numPartitions)
 				{
 					auto &g = gh.gsplit;
-					graph::warp_sorted_count_and_encode_full_stats<T, CPARTSIZE>(
+					mcp::graph::warp_sorted_count_and_encode_full_stats<T, CPARTSIZE>(
 						sh.ordering, sh.usrcLen,
 						&g.colInd[g.rowPtr[sh.ordering[j]]], 
 						g.splitPtr[sh.ordering[j]] 
@@ -560,7 +568,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 				for (T j = lh.wx; j < sh.usrcLen; j += lh.numPartitions)
 				{
 					auto &g = gh.gsplit;
-					graph::warp_sorted_count_and_encode_full<T, CPARTSIZE>(
+					mcp::graph::warp_sorted_count_and_encode_full<T, CPARTSIZE>(
 						sh.ordering, sh.usrcLen,
 						&g.colInd[g.rowPtr[sh.ordering[j]]], 
 						g.splitPtr[sh.ordering[j]] 
@@ -571,7 +579,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 			
 			__syncthreads();
 
-			if (threadIdx.x == 0 && gh.verbose)
+			if (gh.verbose && threadIdx.x == 0)
 			{
 				float current_density = static_cast<float>(subgraph_edges) / static_cast<float>(sh.usrcLen * (sh.usrcLen - 1));
 				max_subgraph_density = max(max_subgraph_density, current_density);
@@ -592,7 +600,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 			mcp::compute_branches_fast_second_level(lh, sh, int((*gh.Cmax_size)) - 1, sh.num_divs_local);
 
 			// If B = 0
-			if (mcp::b_maximality(gh, sh, lh)) { if (threadIdx.x == 0 && gh.verbose) cut_by_color++; __syncthreads(); continue; }
+			if (mcp::b_maximality(gh, sh, lh)) { if (gh.verbose && threadIdx.x == 0) cut_by_color++; __syncthreads(); continue; }
 
 			mcp::compute_branching_aux_set_second_level(sh, sh.to_col);
 
@@ -614,7 +622,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 			{
 				//printf("warp %u waiting\n", wsh[warpIdx].sm_warp_id);
 				//printf("Waiting warps: %u / %u\n", tail->load(cuda::memory_order_relaxed) - head->load(cuda::memory_order_relaxed), WARPS);
-				wait_for_donor_warp_(gh.work_ready[wsh[warpIdx].sm_warp_id], sh.state, wsh[warpIdx].state, 
+				mcp::wait_for_donor_warp_(gh.work_ready[wsh[warpIdx].sm_warp_id], sh.state, wsh[warpIdx].state, 
 							queue_caller(queue, tickets, head, tail));
 			}
 			__syncwarp();
@@ -688,10 +696,11 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 				mcp::setup_warp_stack_donor_psanse_(gh, lh, wsh[warpIdx]);
 			}
 
-			//if (laneIdx == 0) printf("warp %u starts\n", lh.gwx);
+			__syncwarp();
+
 			while (wsh[warpIdx].l >= wsh[warpIdx].base_l)
 			{
-				__syncwarp();
+				
 				
 				if (!wsh[warpIdx].colored[warp_current_level]) 
 				{				
@@ -707,21 +716,7 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 					if (mcp::b_warp_maximality_(gh, wsh[warpIdx], lh)) { if (laneIdx == 0 && gh.verbose) atomicAdd(&cut_by_color, 1); __syncwarp(); continue; }
 					mcp::compute_warp_branching_aux_set_(lh, wsh[warpIdx], wsh[warpIdx].num_divs_local, wsh[warpIdx].pl + warp_current_level * wsh[warpIdx].num_divs_local, 
 						wsh[warpIdx].al + warp_current_level * wsh[warpIdx].num_divs_local, wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local);
-				}
-
-				// Donates in the global queue
-				if ((*gh.work_stealing) >= gh.iteration_limit)
-				{
-					mcp::prepare_warp_fork_(lh, wsh[warpIdx]);
-					mcp::get_warp_candidates_for_next_level_<true>(lh, wsh[warpIdx], warp_current_level,
-						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local);
-					mcp::try_dequeue_warp_global(lh, gh, wsh[warpIdx], queue_caller(queue, tickets, head, tail));
-
-					if (wsh[warpIdx].fork) mcp::do_warp_fork_global(lh, gh, wsh[warpIdx], wsh[warpIdx].num_divs_local,
-						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local,
-						wsh[warpIdx].al + warp_current_level * wsh[warpIdx].num_divs_local,
-							queue_caller(queue, tickets, head, tail));
-
+					fetch_warp(work_stealing, (*gh.work_stealing), warpIdx); __syncwarp();
 				}
 				
 				// Donates in the local queue
@@ -737,6 +732,21 @@ __global__ void mcp_kernel_l1_wl_donor_w_reduce(
 						wsh[warpIdx].al + warp_current_level * wsh[warpIdx].num_divs_local, sh);
 				}
 
+				// Donates in the global queue
+				if (work_stealing[warpIdx] >= gh.iteration_limit)
+				{
+					mcp::prepare_warp_fork_(lh, wsh[warpIdx]);
+					mcp::get_warp_candidates_for_next_level_<true>(lh, wsh[warpIdx], warp_current_level,
+						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local);
+					mcp::try_dequeue_warp_global(lh, gh, wsh[warpIdx], queue_caller(queue, tickets, head, tail));
+
+					if (wsh[warpIdx].fork) mcp::do_warp_fork_global(lh, gh, wsh[warpIdx], wsh[warpIdx].num_divs_local,
+						wsh[warpIdx].bl + warp_current_level * wsh[warpIdx].num_divs_local,
+						wsh[warpIdx].al + warp_current_level * wsh[warpIdx].num_divs_local,
+							queue_caller(queue, tickets, head, tail));
+
+				}
+				
 				// If B visited
 				if (!mcp::get_next_warp_branching_index_(gh, lh, wsh[warpIdx],
 					wsh[warpIdx].level_pointer_index[warp_current_level], 

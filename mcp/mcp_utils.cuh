@@ -2,13 +2,11 @@
 #include "../include/csrcoo.cuh"
 #include "../include/defs.h"
 #include "../include/queue.cuh"
-#include "../mce/parameter.cuh"
+#include "parameter.cuh"
 #include <cuda/semaphore>
 
 #define current_level (sh.l - 2)
 #define next_level (sh.l - 1)
-#define current_warp_level (sh.l[lh.wx] - 2)
-#define next_warp_level (sh.l[lh.wx] - 1)
 #define warp_current_level (wsh[lh.wx].l - 3)
 #define warp_next_level (wsh[lh.wx].l - 2)
 #define warpIdx (lh.wx)
@@ -17,7 +15,9 @@
 #define min_bounds(i) current_bucket[i]
 #define max_bounds(i) next_bucket[i]
 #define first_thread_block if (threadIdx.x == 0)
-
+#define fetch(shared, global) if (threadIdx.x == 0) shared = global
+#define fetch_both(shared1, global1, shared2, global2) if (threadIdx.x == 0) {shared1 = global1; shared2 = global2;}
+#define fetch_warp(shared, global, warp_id) if (laneIdx == 0) shared[warp_id] = global
 
 namespace mcp 
 {
@@ -122,6 +122,201 @@ struct WARP_SHARED_HANDLE {
     
   bool fork;
 };
+
+// Taken from the previous work
+namespace graph
+{
+
+  template <typename T>
+  __host__ __device__ T binary_search(const T *arr, const T lt, const T rt, const T searchVal, bool &found)
+  {
+    T left = lt, right = rt;
+    found = false;
+    while (left < right)
+    {
+      const T mid = (left + right) / 2;
+      T val = arr[mid];
+      if (val == searchVal)
+      {
+        found = true;
+        return mid;
+      }
+      bool pred = val < searchVal;
+      if (pred)
+      {
+        left = mid + 1;
+      }
+      else
+      {
+        right = mid;
+      }
+    }
+    return left;
+  }
+
+
+    template <typename T, uint CPARTSIZE = 32>
+  __device__ __forceinline__ uint64 warp_sorted_count_and_encode_full(
+      const T *const A, const size_t aSz, T *B,
+      T bSz, T j, T num_divs_local, T *encode)
+  {
+    const int _warpIdx = threadIdx.x / CPARTSIZE; // which warp in thread block
+    const int _laneIdx = threadIdx.x % CPARTSIZE; // which thread in warp
+    // cover entirety of A with warp
+    for (T i = _laneIdx; i < aSz; i += CPARTSIZE)
+    {
+      const T searchVal = A[i];
+      bool found = false;
+      const T lb = graph::binary_search<T>(B, 0, bSz, searchVal, found);
+      if (found)
+      {
+        ////////////////////////////// Device function ///////////////////////
+        T chunk_index = i / 32; // 32 here is the division size of the encode
+        T inChunkIndex = i % 32;
+        atomicOr(&encode[j * num_divs_local + chunk_index], 1 << inChunkIndex);
+
+        T chunk_index1 = j / 32; // 32 here is the division size of the encode
+        T inChunkIndex1 = j % 32;
+        atomicOr(&encode[i * num_divs_local + chunk_index1], 1 << inChunkIndex1);
+        /////////////////////////////////////////////////////////////////////
+      }
+    }
+    return 0;
+  }
+
+  template <typename T, uint CPARTSIZE = 32>
+  __device__ __forceinline__ uint64 warp_sorted_count_and_encode_full_stats(
+      const T *const A, const size_t aSz, T *B,
+      T bSz, T j, T num_divs_local, T *encode, uint32_t &edges)
+  {
+    const int _warpIdx = threadIdx.x / CPARTSIZE; // which warp in thread block
+    const int _laneIdx = threadIdx.x % CPARTSIZE; // which thread in warp
+    // cover entirety of A with warp
+    for (T i = _laneIdx; i < aSz; i += CPARTSIZE)
+    {
+      const T searchVal = A[i];
+      bool found = false;
+      const T lb = graph::binary_search<T>(B, 0, bSz, searchVal, found);
+      if (found)
+      {
+        ////////////////////////////// Device function ///////////////////////
+        T chunk_index = i / 32; // 32 here is the division size of the encode
+        T inChunkIndex = i % 32;
+        atomicOr(&encode[j * num_divs_local + chunk_index], 1 << inChunkIndex);
+
+        T chunk_index1 = j / 32; // 32 here is the division size of the encode
+        T inChunkIndex1 = j % 32;
+        atomicOr(&encode[i * num_divs_local + chunk_index1], 1 << inChunkIndex1);
+        /////////////////////////////////////////////////////////////////////
+        atomicAdd(&edges, 2);
+      }
+    }
+    return 0;
+  }
+
+};
+
+template <typename T, uint CPARTSIZE>
+__device__ __forceinline__ void reduce_part(T partMask, uint64 &warpCount)
+{
+  for (int i = CPARTSIZE / 2; i >= 1; i /= 2)
+    warpCount += __shfl_down_sync(partMask, warpCount, i);
+}
+
+template <typename T, uint CPARTSIZE>
+__device__ __forceinline__ void reduce_part(T partMask, T &warpCount)
+{
+  for (int i = CPARTSIZE / 2; i >= 1; i /= 2)
+    warpCount += __shfl_down_sync(partMask, warpCount, i);
+}
+
+template <typename T, uint CPARTSIZE>
+__device__ __forceinline__ void reduce_part_min(T partMask, T &warpMin)
+{ 
+  warpMin = __reduce_min_sync(__activemask(), warpMin);
+}
+
+template <typename T, uint CPARTSIZE>
+__device__ __forceinline__ void reduce_part_max(T partMask, T &warpMin)
+{ 
+  warpMin = __reduce_max_sync(partMask, warpMin);
+}
+
+__device__ __forceinline__ void wait_for_donor(
+    cuda::atomic<uint32_t, cuda::thread_scope_device> &work_ready, uint32_t &shared_state,
+    queue_callee(queue, tickets, head, tail))
+{
+  uint32_t ns = 8;
+  do
+  {
+    if (work_ready.load(cuda::memory_order_relaxed))
+    {
+      
+      if (work_ready.load(cuda::memory_order_acquire))
+      {
+        shared_state = 2;
+        work_ready.store(0, cuda::memory_order_relaxed);
+        break;
+      }
+    }
+    else if (queue_full(queue, tickets, head, tail, CB))
+    {
+      shared_state = 100;
+      break;
+    }
+  } while (ns = my_sleep(ns));
+}
+
+__device__ __forceinline__ void wait_for_donor_warp(
+    cuda::atomic<uint32_t, cuda::thread_scope_device> &work_ready, uint32_t &shared_state,
+    queue_callee(queue, tickets, head, tail))
+{
+  uint32_t ns = 8;
+  do
+  {
+    if (work_ready.load(cuda::memory_order_relaxed))
+    {
+      
+      if (work_ready.load(cuda::memory_order_acquire))
+      {
+        shared_state = 2;
+        work_ready.store(0, cuda::memory_order_relaxed);
+        break;
+      }
+    }
+    else if (queue_full(queue, tickets, head, tail, WARPS))
+    {
+      shared_state = 100;
+      break;
+    }
+  } while (ns = my_sleep(ns));
+}
+
+__device__ __forceinline__ void wait_for_donor_warp_(
+    cuda::atomic<uint32_t, cuda::thread_scope_device> &work_ready, uint32_t &block_shared_state, uint32_t &warp_shared_state,
+    queue_callee(queue, tickets, head, tail))
+{
+  uint32_t ns = 8;
+  do
+  {
+    if (work_ready.load(cuda::memory_order_relaxed))
+    {
+      
+      if (work_ready.load(cuda::memory_order_acquire))
+      {
+        warp_shared_state = 2;
+        work_ready.store(0, cuda::memory_order_relaxed);
+        break;
+      }
+    }
+    else if (queue_full(queue, tickets, head, tail, WARPS))
+    {
+      warp_shared_state = 100;
+      block_shared_state = 100;
+      break;
+    }
+  } while (ns = my_sleep(ns));
+}
 
 
 template <typename T, uint BLOCK_DIM_X, uint CPARTSIZE>
@@ -348,14 +543,13 @@ template <typename T, uint BLOCK_DIM_X, uint CPARTSIZE>
 __device__ __forceinline__ void compute_kcore_first_level(
   LOCAL_HANDLE<T> &lh,
   SHARED_HANDLE<T, BLOCK_DIM_X, CPARTSIZE> &sh,
-  GLOBAL_HANDLE<T> &gh, const T& num_divs_local, const T const* encode)
+  GLOBAL_HANDLE<T> &gh, const T& num_divs_local, const T const* encode, const T& max_clq)
 {
 
   __shared__ int cur_core, min_degree, todos, ordering_sz;
   __shared__ int currents;
   auto &g = gh.gsplit;
-  const T max_clq = (*gh.Cmax_size);
-
+  
   first_thread_block
   {
     min_degree = sh.usrcLen;
@@ -375,6 +569,8 @@ __device__ __forceinline__ void compute_kcore_first_level(
       _degree += __popc(encode[j * num_divs_local + k]);
     }
 
+    __syncwarp();
+
     reduce_part<T, CPARTSIZE>(lh.partMask, _degree);
 
     __syncwarp();
@@ -390,8 +586,7 @@ __device__ __forceinline__ void compute_kcore_first_level(
 
   __syncthreads();
 
-  first_thread_block
-    cur_core = min_degree;
+  fetch(cur_core, min_degree);
 
   __syncthreads();
 
@@ -399,11 +594,7 @@ __device__ __forceinline__ void compute_kcore_first_level(
   while (todos > 0)
   {
 
-    first_thread_block
-    {
-      sh.current_bucket_sz = 0;
-      sh.next_bucket_sz = 0;
-    }
+    fetch_both(sh.current_bucket_sz, 0, sh.next_bucket_sz, 0);
 
     __syncthreads();
       
@@ -414,8 +605,7 @@ __device__ __forceinline__ void compute_kcore_first_level(
 
     __syncthreads();
 
-    first_thread_block
-      currents = sh.current_bucket_sz;
+    fetch(currents, sh.current_bucket_sz);
 
     __syncthreads();
 
@@ -436,9 +626,7 @@ __device__ __forceinline__ void compute_kcore_first_level(
         const T node = sh.current_bucket[j];
 
         if (lh.lx == 0 && cur_core + 1 >= max_clq) {
-          T old_idx = 0;
-          sh.ordering[old_idx = atomicAdd(&ordering_sz, 1)] = g.colInd[sh.usrcStart + node];
-          //sh.cores[old_idx] = cur_core;
+          sh.ordering[atomicAdd(&ordering_sz, 1)] = g.colInd[sh.usrcStart + node];
         }
         __syncwarp();
 
@@ -485,11 +673,7 @@ __device__ __forceinline__ void compute_kcore_first_level(
 
   }
 
-  first_thread_block
-  {
-    sh.usrcLen = ordering_sz;
-    sh.max_core_l1 = cur_core - 1;
-  } 
+  fetch_both(sh.usrcLen, ordering_sz, sh.max_core_l1, cur_core - 1);
   __syncthreads();
 
 }
@@ -562,7 +746,6 @@ __device__ __forceinline__ void reduce_or(LOCAL_HANDLE<T>& lh, unsigned* sh_ptr,
   if (lh.lx == 0)
     atomicOr(sh_ptr, any);
 
-  __syncthreads();
 }
 
 
@@ -578,10 +761,11 @@ __device__ __forceinline__ void compute_P_intersection_for_next_level(
   for (T j = threadIdx.x; j < num_divs_local; j += blockDim.x)
   {
     const T m = (j == sh.lastMask_i) ? sh.lastMask_ii : 0xFFFFFFFF;
+    const T t = sh.encode[lh.newIndex * num_divs_local + j];
     const T prevCandMask = (j > prevCandBlock) ? 0x00000000 : 
       ((j < prevCandBlock) ? 0xFFFFFFFF : ((1 << (prevCand & 0x1F)) - 1));
     const T bua = (cur_bl[j] & prevCandMask) | cur_al[j];
-    const T tbua = bua & m & sh.encode[lh.newIndex * num_divs_local + j];
+    const T tbua = bua & m & t;
     cur_pl[j] = tbua;
   }
 
@@ -600,10 +784,11 @@ __device__ __forceinline__ void compute_warp_P_intersection_second_level(
   for (T j = laneIdx; j < num_divs_local; j += CPARTSIZE)
   {
     const T m = (j == wsh.lastMask_i) ? wsh.lastMask_ii : 0xFFFFFFFF;
+    const T t = wsh.encode[wsh.i * num_divs_local + j];
     const T prevCandMask = (j > prevCandBlock) ? 0x00000000 : 
       ((j < prevCandBlock) ? 0xFFFFFFFF : ((1 << (prevCand & 0x1F)) - 1));
     const T bua = (cur_bl[j] & prevCandMask) | cur_al[j];
-    const T tbua = bua & m & wsh.encode[wsh.i * num_divs_local + j];
+    const T tbua = bua & m & t;
     cur_pl[j] = tbua;
   }
 
@@ -623,10 +808,11 @@ __device__ __forceinline__ void compute_warp_P_intersection_for_next_level_(
   for (T j = laneIdx; j < num_divs_local; j += CPARTSIZE)
   {
     const T m = (j == wsh.lastMask_i) ? wsh.lastMask_ii : 0xFFFFFFFF;
+    const T t = wsh.encode[lh.newIndex * num_divs_local + j];
     const T prevCandMask = (j > prevCandBlock) ? 0x00000000 : 
       ((j < prevCandBlock) ? 0xFFFFFFFF : ((1 << (prevCand & 0x1F)) - 1));
     const T bua = (cur_bl[j] & prevCandMask) | cur_al[j];
-    const T tbua = bua & m & wsh.encode[lh.newIndex * num_divs_local + j];
+    const T tbua = bua & m & t;
     cur_pl[j] = tbua;
   }
 
@@ -800,6 +986,8 @@ __device__ __forceinline__ void do_fork(
     }
     __syncthreads();
   }
+
+  __syncthreads();
 }
 
 
@@ -1219,7 +1407,7 @@ __device__ __forceinline__ void try_dequeue(
     GLOBAL_HANDLE<T> &gh, SHARED_HANDLE<T, BLOCK_DIM_X, CPARTSIZE> &sh,
     queue_callee(queue, tickets, head, tail))
 {
-  if (threadIdx.x == 0 && sh.Xx_aux_sz >= 4 && (*gh.work_stealing) >= gh.iteration_limit)
+  if (threadIdx.x == 0 && sh.Xx_aux_sz >= 4)
     queue_dequeue(queue, tickets, head, tail, CB, sh.fork, sh.worker_pos, sh.Xx_aux_sz);
   __syncthreads();
 }
@@ -1328,10 +1516,7 @@ __device__ __forceinline__ bool empty(LOCAL_HANDLE<T> &lh, const T const* set, c
 {
   unsigned _not_empty = 0;
   __shared__ unsigned not_empty;
-  unsigned* not_empty_ptr;
-
-  not_empty_ptr = &not_empty;
-
+  
   if (threadIdx.x == 0)
     not_empty = 0;
 
@@ -1342,8 +1527,10 @@ __device__ __forceinline__ bool empty(LOCAL_HANDLE<T> &lh, const T const* set, c
 
   __syncthreads();
 
-  reduce_or(lh, not_empty_ptr, _not_empty);
+  const unsigned not_empty_reduced = __any_sync(lh.partMask, _not_empty);
 
+  if (lh.lx == 0) atomicOr(&not_empty, not_empty_reduced);
+  
   __syncthreads();
   return !not_empty;
 }
@@ -1549,6 +1736,7 @@ __device__ __forceinline__ bool p_maximality(
   // if P == 0
   if (mcp::empty<T, BLOCK_DIM_X>(lh, sh.pl + current_level * sh.num_divs_local, sh.num_divs_local)) {
     
+    __syncthreads();
     if (threadIdx.x == 0) {
 
       int old = atomicMax((int*)gh.Cmax_size, sh.l - 1);
@@ -1632,6 +1820,7 @@ __device__ __forceinline__ bool b_maximality(
 {
   if (empty<T, BLOCK_DIM_X>(lh, sh.to_bl, sh.num_divs_local)) {
 
+    __syncthreads();
     if (threadIdx.x == 0) {
     
       // int old = atomicMax((int*)gh.Cmax_size, sh.l - 1);
@@ -3972,10 +4161,7 @@ __device__ __forceinline__ int compute_upperbound_chromatic_number_psanse(
   __shared__ int color;
   __shared__ T pointer;
 
-  if (threadIdx.x == 0)
-  {
-    color = 1;
-  }
+  fetch(color, 1);
 
   __syncthreads();
 
@@ -3996,8 +4182,7 @@ __device__ __forceinline__ int compute_upperbound_chromatic_number_psanse(
 
     __syncthreads();
     
-    if (threadIdx.x == 0) 
-      pointer = 0;
+    fetch(pointer, 0);
 
     __syncthreads();
     
@@ -4943,9 +5128,8 @@ __device__ __forceinline__ void compute_branches_fast(
   __shared__ int color;
   __shared__ int pointer;
 
-  if (threadIdx.x == 0){
-    color = 1;
-  }
+  fetch(color, 1);
+
   __syncthreads();
 
   for (T j = threadIdx.x; j < num_divs_local; j += BLOCK_DIM_X)
@@ -4961,8 +5145,7 @@ __device__ __forceinline__ void compute_branches_fast(
 
     __syncthreads();
     
-    if (threadIdx.x == 0) 
-      pointer = 0;
+    fetch(pointer, 0);
 
     __syncthreads();
     
@@ -4989,18 +5172,13 @@ __device__ __forceinline__ void compute_branches_fast(
       __syncthreads();
     }
 
-    if (threadIdx.x == 0) 
-      color++;
-
+    if (threadIdx.x == 0) color++;
     __syncthreads();
 
   }
 
-  if (threadIdx.x == 0)
-  {
-    sh.colored[level] = true;
-    //sh.level_pointer_index[level] = r + 1;
-  }
+  fetch(sh.colored[level], true);
+  
   __syncthreads();
   return;
 }

@@ -7,7 +7,7 @@
 #include "graph_queue.cuh"
 #include "logger.h"
 #include "utils.cuh"
-#include "../mce/mce_utils.cuh"
+#include "../mcp/mcp_utils.cuh"
 
 #define LEVEL_SKIP_SIZE (128)
 
@@ -118,14 +118,14 @@ __global__ void getNodeNumberReducedByLB_kernel(graph::COOCSRGraph_d<T> g, T* co
 	for (T j = gtid; j < g.numNodes; j += blockDim.x * gridDim.x)
 	{
 		// Get just vertex whose core number greater than lb
-		if (coreNumber[j] > (lower_bound - 1))
+		if (coreNumber[j] >= (lower_bound))
 			local_count++;
 	}
 
 	__syncthreads();
 
 	T mask = 0xFFFFFFFF;
-	reduce_part<T, CPARTSIZE>(mask, local_count);
+	mcp::reduce_part<T, CPARTSIZE>(mask, local_count);
 
 	__syncthreads();
 
@@ -147,7 +147,7 @@ __global__ void computeFlags_kernel(graph::COOCSRGraph_d<T> g, T* coreNumber, un
 	for (T j = gtid; j < g.numNodes; j += blockDim.x * gridDim.x)
 	{
 		// Get just vertex whose core number greater than lb
-		flags[j] = coreNumber[j] > (lower_bound - 1) ? 1 : 0;
+		flags[j] = coreNumber[j] >= (lower_bound) ? 1 : 0;
 	}	
 }
 
@@ -204,14 +204,14 @@ __global__ void getEdgeNumberAndDegreesReducedByLB_kernel(graph::COOCSRGraph_d<T
 	{
 		T local_count = 0;
 		// Get just vertex whose core number greater than lb
-		if (coreNumber[j] > lower_bound - 1) {
+		if (coreNumber[j] >= lower_bound) {
 			
 			T old_degree = g.rowPtr[j + 1] - g.rowPtr[j];
 			T offset = g.rowPtr[j];
 			for (int i = 0; i < old_degree; i++)
 			{
 				T vertex = g.colInd[offset + i];
-				local_count += coreNumber[vertex] > (lower_bound - 1) ? 1 : 0;
+				local_count += coreNumber[vertex] >= (lower_bound) ? 1 : 0;
 			}
 		}
 
@@ -224,7 +224,7 @@ __global__ void getEdgeNumberAndDegreesReducedByLB_kernel(graph::COOCSRGraph_d<T
 
 	// Sum in parallel
 	T mask = 0xFFFFFFFF;
-	reduce_part<T, CPARTSIZE>(mask, global_count);
+	mcp::reduce_part<T, CPARTSIZE>(mask, global_count);
 
 	__syncthreads();
 
@@ -291,7 +291,7 @@ __global__ void buildReducedByLBB_kernel(graph::COOCSRGraph_d<T> g, graph::COOCS
 	{  
 		T vertex = g.colInd[old_offset + i];
 
-		if (coreNumber[vertex] > (lower_bound - 1)) 
+		if (coreNumber[vertex] >= (lower_bound)) 
 		{
 			red_g.colInd[offset + j] = newName[vertex];
 			red_g.rowInd[offset + j++] = node;
@@ -305,7 +305,7 @@ template <typename T, typename PeelType, uint CPARTSIZE = 32>
 __global__ void buildReducedByLBBW_kernel(graph::COOCSRGraph_d<T> g, graph::COOCSRGraph_d<T> red_g, T* coreNumber, T* oldName, T* newName, unsigned int lower_bound)
 {
 	uint64 wgtid = (threadIdx.x + blockIdx.x * blockDim.x) / CPARTSIZE;
-	const uint laneIdx = threadIdx.x % CPARTSIZE;
+	const uint _laneIdx = threadIdx.x % CPARTSIZE;
 
 	// Gets the node
 	T node = wgtid;
@@ -321,7 +321,7 @@ __global__ void buildReducedByLBBW_kernel(graph::COOCSRGraph_d<T> g, graph::COOC
 	uint64 old_offset = g.rowPtr[oldName[node]];
 	uint64 offset = red_g.rowPtr[node];
 	
-	if (laneIdx == 0)
+	if (_laneIdx == 0)
 	{
 		for (int i = 0; i < old_degree; i++)
 		{  
@@ -354,7 +354,7 @@ kernel_partition_level_next(
 {
 	const size_t partitionsPerBlock = BD / P;
 	const size_t lx = threadIdx.x % P;
-	const int warpIdx = threadIdx.x / P; // which warp in thread block
+	const int _warpIdx = threadIdx.x / P; // which warp in thread block
 	const size_t gwx = (blockDim.x * blockIdx.x + threadIdx.x) / P;
 
 	for (auto i = gwx; i < current.count[0]; i += blockDim.x * gridDim.x / P)
@@ -390,7 +390,7 @@ kernel_partition_remove_vertices(
 {
 	const size_t partitionsPerBlock = BD / P;
 	const size_t lx = threadIdx.x % P;
-	const int warpIdx = threadIdx.x / P; // which warp in thread block
+	const int _warpIdx = threadIdx.x / P; // which warp in thread block
 	const size_t gwx = (blockDim.x * blockIdx.x + threadIdx.x) / P;
 
 	for (auto i = gwx; i < clique.count[0]; i += blockDim.x * gridDim.x / P)
@@ -805,113 +805,7 @@ namespace graph
 			degree_q.free();
 			remaining.freeGPU();
 		}
-
-		void find_heur_clique_parallel(COOCSRGraph_d<T> &g)
-		{
-			graph::GraphQueue<T, bool> kcore_q;
-			kcore_q.Create(gpu, g.numNodes, dev_);
-			kcore_q.mark.setAll(false, true);
-			kcore_q.count.setSingle(0, 0, true);
-
-			graph::GraphQueue<T, bool> clique_q;
-			clique_q.Create(gpu, g.numNodes, dev_);
-			clique_q.mark.setAll(false, true);
-			clique_q.count.setSingle(0, 0, true);
-
-			graph::GraphQueue<PeelT, bool> degree_q;
-			degree_q.Create(gpu, g.numNodes, dev_);
-			
-			graph::GraphQueue<T, bool> clique_next_q;
-			clique_next_q.Create(gpu, g.numNodes, dev_);
-			
-			GPUArray<PeelT> _nodeDegree;
-			_nodeDegree.initialize("Aux degrees", AllocationTypeEnum::unified, g.numNodes, dev_);
-			_nodeDegree.setAll(0, true);
-
-			GPUArray<int> remaining;
-			remaining.initialize("Ramaining nodes", AllocationTypeEnum::unified, 1, dev_);
-
-			heurCliqueSize.initialize("Heur Clique", AllocationTypeEnum::unified, 1, dev_);
-			heurCliqueSize.setSingle(0, 0, true);
-
-			auto block_size = 256;
-			auto node_grid_size = (g.numNodes + block_size - 1) / block_size;
-			execKernel((kernel_fill_max_core_vertices<T, PeelT, 256, 32>), node_grid_size, block_size, dev_, false, g, coreNumber.gdata(),
-										kcore_q.device_queue->gdata()[0], k - 1);
-			auto grid_size = (kcore_q.count.getSingle(0) + block_size - 1) / block_size;
-			execKernel((kernel_compute_degree_kcore<T, PeelT, 256, 32>), grid_size, block_size, dev_, false, g,
-										kcore_q.device_queue->gdata()[0], _nodeDegree.gdata());
-
-			remaining.setSingle(0, kcore_q.count.getSingle(0), true);
-			GPUArray<PeelT> min_degree;
-			min_degree.initialize("minimum degree", AllocationTypeEnum::unified, 1, dev_);
-			min_degree.setSingle(0, k, true);
-			GPUArray<T> node;
-			node.initialize("node", AllocationTypeEnum::unified, 1, dev_);
-
-			while (remaining.getSingle(0) > 0)
-			{
-
-				cudaDeviceSynchronize();
-
-				const auto block_size = 256;
-				degree_q.count.setSingle(0, 0, true);
-				execKernel((kernel_fill_candidates_vertex<T, PeelT, 256, 32>), grid_size, block_size, dev_, false, g, _nodeDegree.gdata(),
-										kcore_q.device_queue->gdata()[0], degree_q.device_queue->gdata()[0]);
-				
-				// min degree
-				{
-					void *d_temp_storage = nullptr;
-					size_t temp_storage_bytes = 0;
-					cub::KeyValuePair<int, PeelT> *d_out;
-					cub::KeyValuePair<int, PeelT> *h_out = new cub::KeyValuePair<int, PeelT>();
-					CUDA_RUNTIME(cudaMalloc((void**)&d_out, sizeof(cub::KeyValuePair<int, PeelT>)));
-					cub::DeviceReduce::ArgMin(d_temp_storage, temp_storage_bytes, degree_q.queue.gdata(), d_out, degree_q.count.getSingle(0));
-					CUDA_RUNTIME(cudaMalloc(&d_temp_storage, temp_storage_bytes));
-					cub::DeviceReduce::ArgMin(d_temp_storage, temp_storage_bytes, degree_q.queue.gdata(), d_out, degree_q.count.getSingle(0));
-					CUDA_RUNTIME(cudaFree(d_temp_storage));
-					cudaMemcpy(h_out, d_out, sizeof(cub::KeyValuePair<int, PeelT>), ::cudaMemcpyDeviceToHost);
-					auto argmin = h_out->key;
-					cudaFree(d_out);
-					free(h_out);	
-					min_degree.setSingle(0, degree_q.queue.getSingle(argmin), true);
-				}
-
-				if (min_degree.getSingle(0) + 1 == remaining.getSingle(0))
-				{
-					heurCliqueSize.setSingle(0, min_degree.getSingle(0) + 1, true);
-					remaining.setSingle(0, 0, true);
-					break;
-				}
-
-				clique_q.count.setSingle(0, 0, true);
-				execKernel((kernel_get_minimum_degree_vertices<T, PeelT, 256, 32>), grid_size, block_size, dev_, false, g, _nodeDegree.gdata(),
-											kcore_q.device_queue->gdata()[0], clique_q.device_queue->gdata()[0], min_degree.getSingle(0));
-
-				auto grid_warp_size = (32 * clique_q.count.getSingle(0) + block_size - 1) / block_size;
-				execKernel((kernel_partition_remove_vertices<T, PeelT, 256, 32>), grid_warp_size, block_size, dev_, false,
-										g,
-										_nodeDegree.gdata(),
-										kcore_q.device_queue->gdata()[0],
-										clique_q.device_queue->gdata()[0],
-										min_degree.getSingle(0));
-
-				remaining.setSingle(0, remaining.getSingle(0) - clique_q.count.getSingle(0), true);
-				
-				auto clique_grid_size = (clique_q.count.getSingle(0) + block_size - 1) / block_size;
-				execKernel((kernel_update_marks<T, PeelT, 256, 32>), clique_grid_size, block_size, dev_, false,
-										g,
-										kcore_q.device_queue->gdata()[0],
-										clique_q.device_queue->gdata()[0]);
-
-
-			}
-
-			min_degree.freeGPU();
-			_nodeDegree.freeGPU();
-			clique_q.free();
-			remaining.freeGPU();
-		}
+		
 
 		void AscendingGpu(int n, GPUArray<T> &identity_arr_asc)
 		{

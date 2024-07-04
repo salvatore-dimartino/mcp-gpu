@@ -9,11 +9,10 @@
 #include "../include/defs.h"
 #include "../include/logger.h"
 #include "../include/queue.cuh"
-#include "../mce/parameter.cuh"
 #include "mcp_kernel_wl_donor.cuh"
 #include "mcp_kernel_wl_donor_warp.cuh"
-#include "../mce/mce_utils.cuh"
-#include "../mcp/mcp_utils.cuh"
+#include "parameter.cuh"
+#include "mcp_utils.cuh"
 
 using namespace std;
 
@@ -21,6 +20,60 @@ using namespace std;
 
 namespace graph
 {
+
+  template <typename T, int BLOCK_DIM_X>
+  __global__ void getNodeDegree_kernel(T *node_degree, graph::COOCSRGraph_d<T> g, T *max_degree)
+  {
+    T gtid = threadIdx.x + blockIdx.x * blockDim.x;
+    typedef cub::BlockReduce<T, BLOCK_DIM_X> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    T degree = 0;
+    if (gtid < g.numNodes)
+    {
+      degree = g.rowPtr[gtid + 1] - g.rowPtr[gtid];
+      node_degree[gtid] = degree;
+    }
+
+    T aggregate = BlockReduce(temp_storage).Reduce(degree, cub::Max());
+    if (threadIdx.x == 0)
+      atomicMax(max_degree, aggregate);
+  }
+
+  template <typename T, int BLOCK_DIM_X>
+  __global__ void getSplitDegree_kernel(T *node_degree, graph::COOCSRGraph_d<T> g, T *max_degree)
+  {
+    T gtid = threadIdx.x + blockIdx.x * blockDim.x;
+    typedef cub::BlockReduce<T, BLOCK_DIM_X> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    T degree = 0;
+    if (gtid < g.numNodes)
+    {
+      degree = g.rowPtr[gtid + 1] - g.splitPtr[gtid];
+      node_degree[gtid] = degree;
+    }
+
+    T aggregate = BlockReduce(temp_storage).Reduce(degree, cub::Max());
+    if (threadIdx.x == 0)
+      atomicMax(max_degree, aggregate);
+  }
+
+  template <typename T, int BLOCK_DIM_X>
+  __global__ void getPreSplitDegree_kernel(T *node_degree, graph::COOCSRGraph_d<T> g, T *max_degree)
+  {
+    T gtid = threadIdx.x + blockIdx.x * blockDim.x;
+    typedef cub::BlockReduce<T, BLOCK_DIM_X> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    T degree = 0;
+    if (gtid < g.numNodes)
+    {
+      degree = g.splitPtr[gtid] - g.rowPtr[gtid];
+      node_degree[gtid] = degree;
+    }
+
+    T aggregate = BlockReduce(temp_storage).Reduce(degree, cub::Max());
+    if (threadIdx.x == 0)
+      atomicMax(max_degree, aggregate);
+  }
 
   template <typename T>
   class MultiGPU_MCP
@@ -33,27 +86,20 @@ namespace graph
     GPUArray<T> node_degree, max_degree, max_undirected_degree;
     GPUArray<T> encoded_induced_subgraph, current, next, ordering;
     GPUArray<T> P, A, B, Iset, Iset_count, Xx_aux, level_pointer, work_stealing, C, Cmax;
-    GPUArray<T> degrees;
     GPUArray<bool> colored; 
     GPUArray<uint32_t> global_message;
     cuda::atomic<uint32_t, cuda::thread_scope_device> *work_ready = nullptr;
     cuda::binary_semaphore<cuda::thread_scope_device> *max_clique_sem = nullptr;
     uint32_t * d_core_numbers;
     queue_declare(queue, tickets, head, tail);
-    uint32_t Cmax_size;
-    uint32_t* d_Cmax_size;
-    T * d_cut_by_kcore_l1;
-    T max_core, cut_by_kcore_l1;
-    T * d_cut_by_color, *d_cut_by_color_l1;
-    T cut_by_color, cut_by_color_l1;
-    float* d_max_subgraph_density;
-    float max_subgraph_density, avg_subgraph_density;
-    float* d_avg_subgraph_density;
-    uint32_t *d_number_of_subgraphs;
-    uint32_t number_of_subgraphs;
-    uint32_t *d_max_subgraph_width, *d_avg_subgraph_width;
+    uint32_t Cmax_size, *d_Cmax_size = nullptr;
+    T * d_cut_by_kcore_l1 = nullptr, max_core, *cut_by_kcore_l1 = nullptr;
+    T * d_cut_by_color = nullptr, *d_cut_by_color_l1 = nullptr, cut_by_color, cut_by_color_l1;
+    float* d_max_subgraph_density = nullptr, max_subgraph_density, avg_subgraph_density, *d_avg_subgraph_density = nullptr;
+    uint32_t *d_number_of_subgraphs = nullptr, number_of_subgraphs;
+    uint32_t *d_max_subgraph_width = nullptr, *d_avg_subgraph_width = nullptr;
     uint32_t max_subgraph_width, avg_subgraph_width;
-    unsigned long long *d_branches, branches;
+    unsigned long long *d_branches = nullptr, branches;
 
     MultiGPU_MCP(int dev, int global_id, int total_instance, uint32_t *core_numbers, T max_core) 
       : dev_(dev), global_id_(global_id), total_instance_(total_instance), d_core_numbers(core_numbers), max_core(max_core)
@@ -102,7 +148,6 @@ namespace graph
 
       Log(info, "Max directed degree: %u, max undirected degree: %u", max_degree.gdata()[0], max_undirected_degree.gdata()[0]);
       
-
       size_t free, total;
       CUDAContext context;
       T num_SMs = context.num_SMs;
@@ -111,7 +156,7 @@ namespace graph
       
       if (!config.warp_parallel)
       {
-        if (config.block_size == 128)
+        if (config.block_size == 64)
         {
           if ((uint64)max_degree.gdata()[0] < 8192) 
           {
@@ -139,7 +184,7 @@ namespace graph
         }
       }else
       {
-        if (config.block_size == 128)
+        if (config.block_size == 64)
         {
           if ((uint64)max_degree.gdata()[0] < 5000) 
           {
@@ -164,7 +209,6 @@ namespace graph
       const uint max_level = max_core + 2;
       const uint num_divs = (max_degree.gdata()[0] + dv - 1) / dv;
       const uint64 encode_size = (uint64)num_SMs * conc_blocks_per_SM * (max_degree.gdata()[0] * num_divs);
-      //Log(info, "SMs: %u", num_SMs);
 
       encoded_induced_subgraph.initialize("induced subgraph", gpu, encode_size, dev_);
 
@@ -191,24 +235,28 @@ namespace graph
       float zero = 0.0f;
       CUDA_RUNTIME(cudaMalloc((void **)&d_Cmax_size, sizeof(uint32_t)));
       CUDA_RUNTIME(cudaMemcpy((void *)d_Cmax_size, &config.lb, sizeof(uint32_t), ::cudaMemcpyHostToDevice));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_avg_subgraph_density, sizeof(float)));
-      CUDA_RUNTIME(cudaMemcpy((void *)d_avg_subgraph_density, &zero, sizeof(float), ::cudaMemcpyHostToDevice));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_max_subgraph_density, sizeof(float)));
-      CUDA_RUNTIME(cudaMemcpy((void *)d_max_subgraph_density, &zero, sizeof(float), ::cudaMemcpyHostToDevice));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_number_of_subgraphs, sizeof(uint32_t)));
-      CUDA_RUNTIME(cudaMemset(d_number_of_subgraphs, 0, sizeof(uint32_t)));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_cut_by_color_l1, sizeof(T)));
-      CUDA_RUNTIME(cudaMemset(d_cut_by_color_l1, 0, sizeof(T)));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_cut_by_color, sizeof(T)));
-      CUDA_RUNTIME(cudaMemset(d_cut_by_color, 0, sizeof(T)));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_cut_by_kcore_l1, sizeof(T)));
-      CUDA_RUNTIME(cudaMemset(d_cut_by_kcore_l1, 0, sizeof(T)));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_max_subgraph_width, sizeof(uint32_t)));
-      CUDA_RUNTIME(cudaMemset(d_max_subgraph_width, 0, sizeof(uint32_t)));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_avg_subgraph_width, sizeof(uint32_t)));
-      CUDA_RUNTIME(cudaMemset(d_avg_subgraph_width, 0, sizeof(uint32_t)));
-      CUDA_RUNTIME(cudaMalloc((void **)&d_branches, sizeof(unsigned long long)));
-      CUDA_RUNTIME(cudaMemset(d_branches, 0, sizeof(unsigned long long)));
+
+      if (config.verbose)
+      {
+        CUDA_RUNTIME(cudaMalloc((void **)&d_avg_subgraph_density, sizeof(float)));
+        CUDA_RUNTIME(cudaMemcpy((void *)d_avg_subgraph_density, &zero, sizeof(float), ::cudaMemcpyHostToDevice));
+        CUDA_RUNTIME(cudaMalloc((void **)&d_max_subgraph_density, sizeof(float)));
+        CUDA_RUNTIME(cudaMemcpy((void *)d_max_subgraph_density, &zero, sizeof(float), ::cudaMemcpyHostToDevice));
+        CUDA_RUNTIME(cudaMalloc((void **)&d_number_of_subgraphs, sizeof(uint32_t)));
+        CUDA_RUNTIME(cudaMemset(d_number_of_subgraphs, 0, sizeof(uint32_t)));
+        CUDA_RUNTIME(cudaMalloc((void **)&d_cut_by_color_l1, sizeof(T)));
+        CUDA_RUNTIME(cudaMemset(d_cut_by_color_l1, 0, sizeof(T)));
+        CUDA_RUNTIME(cudaMalloc((void **)&d_cut_by_color, sizeof(T)));
+        CUDA_RUNTIME(cudaMemset(d_cut_by_color, 0, sizeof(T)));
+        CUDA_RUNTIME(cudaMalloc((void **)&d_cut_by_kcore_l1, sizeof(T)));
+        CUDA_RUNTIME(cudaMemset(d_cut_by_kcore_l1, 0, sizeof(T)));
+        CUDA_RUNTIME(cudaMalloc((void **)&d_max_subgraph_width, sizeof(uint32_t)));
+        CUDA_RUNTIME(cudaMemset(d_max_subgraph_width, 0, sizeof(uint32_t)));
+        CUDA_RUNTIME(cudaMalloc((void **)&d_avg_subgraph_width, sizeof(uint32_t)));
+        CUDA_RUNTIME(cudaMemset(d_avg_subgraph_width, 0, sizeof(uint32_t)));
+        CUDA_RUNTIME(cudaMalloc((void **)&d_branches, sizeof(unsigned long long)));
+        CUDA_RUNTIME(cudaMemset(d_branches, 0, sizeof(unsigned long long)));
+      }
     
       level_pointer.initialize("level pointer", gpu, level_item_size, dev_);
       encoded_induced_subgraph.setAll(0, true);
@@ -231,9 +279,13 @@ namespace graph
 
       CUDA_RUNTIME(cudaMalloc((void **)&work_ready, conc_blocks * hybrid_per_warp * sizeof(cuda::atomic<uint32_t, cuda::thread_scope_device>)));
       CUDA_RUNTIME(cudaMemset((void *)work_ready, 0, conc_blocks * hybrid_per_warp * sizeof(cuda::atomic<uint32_t, cuda::thread_scope_device>)));
-      CUDA_RUNTIME(cudaMalloc((void **)&max_clique_sem, sizeof(cuda::binary_semaphore<cuda::thread_scope_device>)));
-      cuda::binary_semaphore<cuda::thread_scope_device> init_sem{1};
-      cudaMemcpy(max_clique_sem, &init_sem, sizeof(cuda::binary_semaphore<cuda::thread_scope_device>), ::cudaMemcpyHostToDevice);
+      
+      if (config.mt == MAINTASK::MCP_EVAL)
+      {
+        cuda::binary_semaphore<cuda::thread_scope_device> init_sem{1};
+        CUDA_RUNTIME(cudaMalloc((void **)&max_clique_sem, sizeof(cuda::binary_semaphore<cuda::thread_scope_device>)));
+        CUDA_RUNTIME(cudaMemcpy(max_clique_sem, &init_sem, sizeof(cuda::binary_semaphore<cuda::thread_scope_device>), ::cudaMemcpyHostToDevice));
+      }
 
       global_message = GPUArray<uint32_t>("global message", gpu, conc_blocks * msg_cnt * hybrid_per_warp, dev_);
       const uint queue_size = conc_blocks * hybrid_per_warp;
@@ -517,7 +569,13 @@ namespace graph
                     grid_block_size, block_size, dev_, stream_, false,
                     gh, queue_caller(queue, tickets, head, tail));
       
-      sync();
+      //sync();
+
+      
+    }
+
+    void get_results(Config config, COOCSRGraph_d<T> &gsplit)
+    {
 
       if (config.verbose)
       {
@@ -546,7 +604,8 @@ namespace graph
         }
       }
 
-      cudaMemcpy(&Cmax_size, d_Cmax_size, sizeof(uint32_t), ::cudaMemcpyDeviceToHost);
+      CUDA_RUNTIME(cudaMemcpy((void *)&Cmax_size, d_Cmax_size, sizeof(uint32_t), ::cudaMemcpyDeviceToHost));
+      CUDA_RUNTIME(cudaDeviceSynchronize());
 
       if (config.mt == MAINTASK::MCP_EVAL)
       {
@@ -619,9 +678,12 @@ namespace graph
       P.freeGPU();
       B.freeGPU();
       A.freeGPU();
+      C.freeGPU();
+      Cmax.freeGPU();
       Iset.freeGPU();
       Iset_count.freeGPU();
-      
+      Xx_aux.freeGPU();
+
       level_pointer.freeGPU();
       node_degree.freeGPU();
       max_degree.freeGPU();
@@ -630,24 +692,34 @@ namespace graph
       next.freeGPU();
       current.freeGPU();
       max_undirected_degree.freeGPU();
-      cudaFree(d_max_subgraph_density);
-      cudaFree(d_avg_subgraph_density);
-      cudaFree(d_max_subgraph_width);
-      cudaFree(d_avg_subgraph_width);
 
-      //Cmax.freeGPU();
-      cudaFree(d_Cmax_size);
-      cudaFree(d_cut_by_color);
-      cudaFree(d_cut_by_color_l1);
-      cudaFree(d_cut_by_kcore_l1);
-      cudaFree(d_number_of_subgraphs);
-      cudaFree(d_branches);
-      Xx_aux.freeGPU();
+      if (max_clique_sem != nullptr)
+        CUDA_RUNTIME(cudaFree(max_clique_sem));
+
+      if (d_max_subgraph_density != nullptr)
+        CUDA_RUNTIME(cudaFree(d_max_subgraph_density));
+      if (d_avg_subgraph_density != nullptr)
+        CUDA_RUNTIME(cudaFree(d_avg_subgraph_density));
+      if (d_max_subgraph_width != nullptr)
+        CUDA_RUNTIME(cudaFree(d_max_subgraph_width));
+      if (d_avg_subgraph_width != nullptr)
+        CUDA_RUNTIME(cudaFree(d_avg_subgraph_width));
+      if (d_Cmax_size != nullptr)
+        CUDA_RUNTIME(cudaFree(d_Cmax_size));
+      if (d_cut_by_color != nullptr)
+        CUDA_RUNTIME(cudaFree(d_cut_by_color));
+      if (d_cut_by_color_l1 != nullptr)
+        CUDA_RUNTIME(cudaFree(d_cut_by_color_l1));
+      if (d_cut_by_kcore_l1 != nullptr)
+        CUDA_RUNTIME(cudaFree(d_cut_by_kcore_l1));
+      if (d_number_of_subgraphs != nullptr)
+        CUDA_RUNTIME(cudaFree(d_number_of_subgraphs));
+      if (d_branches != nullptr)
+        CUDA_RUNTIME(cudaFree(d_branches));
 
       if (work_ready != nullptr)
-      {
         CUDA_RUNTIME(cudaFree((void *)work_ready));
-      }
+      
       global_message.freeGPU();
       queue_free(queue, tickets, head, tail);
     }
