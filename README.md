@@ -18,16 +18,16 @@ Easy build can be done by launching the following command:
 make all
 ```
 The executable `parallel_mcp_on_gpus` will be created in the main directory.
-In case you use different hardware changes the SM Architecture that has been set by default at `sm_86` and `compute_86`.
+In case you use different hardware, please change the SM Architecture that has been set by default at `sm_86` and `compute_86`.
 
 ## Usage
 
-Options will be available launching the command
+Options will be available launching the command `h`
 
 ```
 ./parallel_mcp_on_gpus -h
 ```
-Pay attention you cannot launch the raw asii adjacency list input graph format it, first of all must be converted in a binary format. for instance if the input graph is a market format:
+Pay attention you cannot launch the raw ascii adjacency list input graph format, first of all must be converted in a binary format. for instance if the input graph is a market format:
 
 ```
 ./parallel_mcp_on_gpus -g <input_graph.mtx> -r <output_graph.bel> -m convert
@@ -45,10 +45,10 @@ As already seen the task `convert` converts the input ascii format in the binary
 Is it possible to specify more than one pruning strategy (`c` option):
 
 - `psanse`: uses the default coloring proposed by San Segundo in BBMC[SP]/BBMCI Algorithm
-- `recolor`: uses the ReColor prunyng strategy from San Segund's BBMCR
+- `recolor`: uses the ReColor pruning strategy from San Segundo's BBMCR
 - `number`: uses Tomita's NUMBER Algorithm to perform Coloring
 - `renumber`: uses Tomita's Re-NUMBER Algorithm to improve Coloring
-- `reduce`: (Experimental BONUS) uses Lemmas from the reduce procedure from MC-BRB algorithm + standard default San Segundo's Coloring
+- `reduce`: (Experimental BONUS) uses Lemmas from the reduce procedure of MC-BRB algorithm and standard default San Segundo's Coloring
 
 ### Warp-wise parallelism
 
